@@ -17,11 +17,14 @@ limitations under the License.
 package service
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/koderover/zadig/v2/pkg/tool/clientmanager"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +58,7 @@ func ServeWs(c *gin.Context) {
 	log.Infof("exec containerName: %s, pod: %s", containerName, podName)
 
 	productName := c.Query("projectName")
+	serviceName := c.Query("serviceName")
 	envName := c.Param("envName")
 	productInfo, err := commonrepo.NewProductColl().Find(&commonrepo.ProductFindOptions{Name: productName, EnvName: envName})
 	if err != nil {
@@ -63,15 +67,57 @@ func ServeWs(c *gin.Context) {
 	}
 	namespace, clusterID := productInfo.Namespace, productInfo.ClusterID
 
-	pty, err := NewTerminalSession(c.Writer, c.Request, nil)
+	sessionID := uuid.New().String()
+	recorder := NewAsciicastRecorder(220, 50, fmt.Sprintf("%s/%s", productName, podName))
+
+	pty, err := NewTerminalSession(c.Writer, c.Request, nil, &TerminalSessionOption{
+		Recorder: recorder,
+	})
 	if err != nil {
 		log.Errorf("get pty failed: %v", err)
 		ctx.RespErr = e.ErrInternalError.AddDesc(fmt.Sprintf("get pty failed: %v", err))
 		return
 	}
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
+	record := &commonmodels.TerminalSessionRecord{
+		SessionID:   sessionID,
+		UserName:    ctx.UserName,
+		ProjectName: productName,
+		ServiceName: serviceName,
+		PodName:     podName,
+		Container:   containerName,
+		Namespace:   namespace,
+		ClusterID:   clusterID,
+		Type:        commonmodels.TerminalSessionTypeEnvironment,
+		Status:      commonmodels.TerminalSessionStatusActive,
+		StartTime:   time.Now().UnixMilli(),
+	}
+
+	globalSessionManager.Register(&ActiveSession{
+		Record:   record,
+		Recorder: recorder,
+		cancel:   cancel,
+	})
+
+	if dbErr := commonrepo.NewTerminalSessionColl().Create(context.Background(), record); dbErr != nil {
+		log.Warnf("failed to persist terminal session %s: %v", sessionID, dbErr)
+	}
+
 	defer func() {
+		cancel()
+		globalSessionManager.Unregister(sessionID)
 		log.Info("close session.")
 		_ = pty.Close()
+
+		compressed, rawSize, searchContent, truncated := recorder.Flush()
+		if dbErr := commonrepo.NewTerminalSessionColl().UpdateClosed(
+			context.Background(), sessionID,
+			time.Now().UnixMilli(), compressed, rawSize, searchContent, truncated,
+		); dbErr != nil {
+			log.Warnf("failed to update terminal session %s: %v", sessionID, dbErr)
+		}
 	}()
 
 	kubeCli, err := clientmanager.NewKubeClientManager().GetKubernetesClientSet(clusterID)
@@ -96,6 +142,8 @@ func ServeWs(c *gin.Context) {
 		return
 	}
 
+	_ = cancelCtx // cancelCtx is used via cancel() in the deferred cleanup above.
+
 	err = ExecPod(clusterID, []string{"/bin/sh"}, pty, namespace, podName, containerName)
 	if err != nil {
 		msg := fmt.Sprintf("Exec to pod error! err: %v", err)
@@ -118,11 +166,10 @@ func DebugWorkflow(c *gin.Context) {
 		return
 	}
 
-	ctx.RespErr = debugWorkflow(c, c.Param("workflowName"), c.Param("jobName"), taskID, logger)
-	return
+	ctx.RespErr = debugWorkflow(c, ctx.UserName, c.Param("workflowName"), c.Param("jobName"), taskID, logger)
 }
 
-func debugWorkflow(c *gin.Context, workflowName, jobName string, taskID int64, logger *zap.SugaredLogger) error {
+func debugWorkflow(c *gin.Context, userName, workflowName, jobName string, taskID int64, logger *zap.SugaredLogger) error {
 	workflowTask, err := commonrepo.NewworkflowTaskv4Coll().Find(workflowName, taskID)
 	if err != nil {
 		return e.ErrStopDebugShell.AddDesc(fmt.Sprintf("failed to find task: %s", err))
@@ -153,6 +200,10 @@ FOR:
 		return e.ErrGetDebugShell.AddDesc("启动调试终端意外失败")
 	}
 
+	sessionID := uuid.New().String()
+	serviceName := c.Query("serviceName")
+	recorder := NewAsciicastRecorder(220, 50, fmt.Sprintf("workflow/%s/%s", workflowName, jobName))
+
 	pty, err := NewTerminalSession(c.Writer, c.Request, nil, &TerminalSessionOption{
 		SecretEnvs: func() (secrets []string) {
 			for _, v := range jobTaskSpec.Properties.Envs {
@@ -162,15 +213,55 @@ FOR:
 			}
 			return secrets
 		}(),
-		Type: Workflow,
+		Type:     Workflow,
+		Recorder: recorder,
 	})
 	if err != nil {
 		log.Errorf("get pty failed: %v", err)
 		return e.ErrGetDebugShell.AddDesc(fmt.Sprintf("get pty failed: %v", err))
 	}
+
+	_, cancel := context.WithCancel(context.Background())
+
+	record := &commonmodels.TerminalSessionRecord{
+		SessionID:    sessionID,
+		UserName:     userName,
+		ProjectName:  workflowTask.ProjectName,
+		ServiceName:  serviceName,
+		PodName:      "", // filled after pod lookup below
+		Container:    "",
+		Namespace:    jobTaskSpec.Properties.Namespace,
+		ClusterID:    jobTaskSpec.Properties.ClusterID,
+		Type:         commonmodels.TerminalSessionTypeWorkflow,
+		Status:       commonmodels.TerminalSessionStatusActive,
+		StartTime:    time.Now().UnixMilli(),
+		WorkflowName: workflowName,
+		TaskID:       taskID,
+	}
+
+	globalSessionManager.Register(&ActiveSession{
+		Record:   record,
+		Recorder: recorder,
+		cancel:   cancel,
+	})
+
+	if dbErr := commonrepo.NewTerminalSessionColl().Create(context.Background(), record); dbErr != nil {
+		log.Warnf("failed to persist terminal session %s: %v", sessionID, dbErr)
+	}
+
 	defer func() {
+		cancel()
+		globalSessionManager.Unregister(sessionID)
 		log.Info("close session.")
 		_ = pty.Close()
+
+		compressed, rawSize, searchContent, truncated := recorder.Flush()
+		if dbErr := commonrepo.NewTerminalSessionColl().UpdateClosed(
+			context.Background(), sessionID,
+			time.Now().UnixMilli(), compressed, rawSize, searchContent, truncated,
+		); dbErr != nil {
+			log.Warnf("failed to update terminal session %s: %v", sessionID, dbErr)
+		}
 	}()
 
 	kubeClient, err := clientmanager.NewKubeClientManager().GetControllerRuntimeClient(jobTaskSpec.Properties.ClusterID)
@@ -195,6 +286,10 @@ FOR:
 		logger.Errorf("debug workflow failed: pod status is %s", pod.Status.Phase)
 		return e.ErrGetDebugShell.AddDesc(fmt.Sprintf("Job 状态 %s 无法启动调试终端", pod.Status.Phase))
 	}
+
+	// Update the record with the actual pod name now that we know it.
+	record.PodName = pod.Name
+	record.Container = pod.Spec.Containers[0].Name
 
 	var envs []string
 	for _, env := range jobTaskSpec.Properties.Envs {

@@ -171,6 +171,13 @@ func (s *engine) injectRouterGroup(router *gin.RouterGroup) {
 		podexec.GET("/:productName/:podName/:containerName/podExec/:envName", podexecservice.ServeWs)
 		podexec.GET("/production/:productName/:podName/:containerName/podExec/:envName", podexecservice.ServeWs)
 		podexec.GET("/debug/:workflowName/:jobName/task/:taskID", podexecservice.DebugWorkflow)
+
+		// session management & audit
+		podexec.GET("/sessions", podexecservice.ListActiveSessions)
+		podexec.GET("/sessions/history", podexecservice.ListHistorySessions)
+		podexec.DELETE("/sessions/:sessionID", podexecservice.InterruptSession)
+		podexec.GET("/sessions/:sessionID/cast", podexecservice.GetSessionCast)
+		podexec.GET("/sessions/:sessionID/watch", podexecservice.WatchSession)
 	}
 
 	// inject picket APIs

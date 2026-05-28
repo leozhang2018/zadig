@@ -82,11 +82,15 @@ type TerminalSession struct {
 	// SecretEnvs is a list of environment variables that should be hidden from the client.
 	SecretEnvs []string
 	Type       TerminalSessionType
+
+	// recorder is the asciicast v2 recorder attached to this session (may be nil).
+	recorder *AsciicastRecorder
 }
 
 type TerminalSessionOption struct {
 	SecretEnvs []string
 	Type       TerminalSessionType
+	Recorder   *AsciicastRecorder
 }
 
 func NewTerminalSession(w http.ResponseWriter, r *http.Request, responseHeader http.Header, opt ...*TerminalSessionOption) (*TerminalSession, error) {
@@ -103,6 +107,7 @@ func NewTerminalSession(w http.ResponseWriter, r *http.Request, responseHeader h
 	if len(opt) > 0 {
 		session.SecretEnvs = opt[0].SecretEnvs
 		session.Type = opt[0].Type
+		session.recorder = opt[0].Recorder
 	}
 	return session, nil
 }
@@ -116,6 +121,9 @@ func (t *TerminalSession) Done() chan struct{} {
 func (t *TerminalSession) Next() *remotecommand.TerminalSize {
 	select {
 	case size := <-t.sizeChan:
+		if t.recorder != nil {
+			t.recorder.WriteResize(size.Width, size.Height)
+		}
 		return &size
 	case <-t.doneChan:
 		return nil
@@ -148,6 +156,11 @@ func (t *TerminalSession) Read(p []byte) (int, error) {
 
 // Write called from remotecommand whenever there is any output
 func (t *TerminalSession) Write(p []byte) (int, error) {
+	// Record raw stdout before any secret masking.
+	if t.recorder != nil {
+		t.recorder.WriteOutput(p)
+	}
+
 	msg, err := json.Marshal(TerminalMessage{
 		Operation: "stdout",
 		Data:      string(p),
